@@ -89,6 +89,33 @@ static int parseInt_buggy(char *s, int *num) {
   return 1;
 }
 
+/*
+ * Copy of the FIXED parseInt from common.cu. Requires the whole string
+ * to be consumed (trailing garbage rejected) and checks errno for
+ * overflow, matching the validated SPLIT_MASK hex path.
+ */
+static int parseInt_fixed(char *s, int *num) {
+  char *p = NULL;
+  if (!s || !num)
+    return 0;
+  while (*s && isspace(*s)) ++s;
+  if (!*s) return 0;
+
+  errno = 0;
+  char *start = s;
+  if (strncasecmp(s, "0b", 2) == 0) {
+    start = s + 2;
+    *num = (int)strtoul(start, &p, 2);
+  } else {
+    *num = (int)strtoul(start, &p, 0);
+  }
+
+  while (*p && isspace(*p)) ++p;
+  if (p == start || *p != '\0' || errno == ERANGE)
+    return 0;
+  return 1;
+}
+
 /* =========================================================================
  * Test 1: Source verification
  * INTENTIONALLY FAILS before the fix is applied.
@@ -129,6 +156,17 @@ int test_source_verified(void) {
       strstr(common_src, "errno == ERANGE") == NULL) {
     snprintf(msg, sizeof(msg),
              "%s: parseInt missing errno check for strtoul overflow",
+             common_path);
+    printf("  FAIL: %s - %s\n", __func__, msg);
+    all_ok = 0;
+  }
+
+  /* Check 4: parseInt requires the whole string to be consumed
+   * (rejects trailing garbage like "2xyz"). */
+  if (strstr(common_src, "*p != '\\0'") == NULL) {
+    snprintf(msg, sizeof(msg),
+             "%s: parseInt missing full-consume check (*p != '\\0'), "
+             "trailing garbage like MOD2xyz accepted",
              common_path);
     printf("  FAIL: %s - %s\n", __func__, msg);
     all_ok = 0;
@@ -413,6 +451,74 @@ int test_division_guard(void) {
 }
 
 /* =========================================================================
+ * Test 8: Table-driven — parseInt must consume the whole string
+ * Proves: the fixed parseInt rejects trailing garbage (e.g. "2xyz"),
+ * so NCCL_TESTS_SPLIT=MOD2xyz is invalid instead of being read as MOD2.
+ * Also confirms the buggy copy accepts "2xyz", pinning the regression.
+ * ========================================================================= */
+
+int test_parseInt_full_consume(void) {
+  struct {
+    const char *input;
+    int expect_valid;   /* whether fixed parseInt should accept it */
+    int expect_num;     /* parsed value when valid */
+    const char *label;
+  } cases[] = {
+    /* positive */
+    { "0",        1, 0,  "zero" },
+    { "42",       1, 42, "plain decimal" },
+    { "0x1f",     1, 31, "hex prefix" },
+    { "0b1010",   1, 10, "binary prefix" },
+    { "  7",      1, 7,  "leading whitespace" },
+    { "9  ",      1, 9,  "trailing whitespace only" },
+    /* negative — trailing garbage (the reviewer's case) */
+    { "2xyz",     0, 0,  "decimal + trailing garbage" },
+    { "0x1fzz",   0, 0,  "hex + trailing garbage" },
+    { "0bxyz",    0, 0,  "0b prefix, no binary digits" },
+    { "0b1012",   0, 0,  "binary + invalid trailing digits" },
+    { "10 20",    0, 0,  "two numbers" },
+    /* negative — no digits at all */
+    { "xyz",      0, 0,  "pure garbage" },
+    { "",         0, 0,  "empty" },
+    { "   ",      0, 0,  "whitespace only" },
+    { NULL,       0, 0,  NULL }
+  };
+
+  for (int i = 0; cases[i].label != NULL; i++) {
+    char buf[64];
+    char msg[256];
+    int num = -12345;
+
+    /* fixed parseInt takes char*; copy to a mutable buffer */
+    snprintf(buf, sizeof(buf), "%s", cases[i].input);
+    int valid = parseInt_fixed(buf, &num);
+
+    if (valid != cases[i].expect_valid) {
+      snprintf(msg, sizeof(msg),
+               "parseInt_fixed('%s') (%s): expected %s, got %s",
+               cases[i].input, cases[i].label,
+               cases[i].expect_valid ? "valid" : "invalid",
+               valid ? "valid" : "invalid");
+      TEST_ASSERT(0, msg);
+    }
+    if (cases[i].expect_valid && num != cases[i].expect_num) {
+      snprintf(msg, sizeof(msg),
+               "parseInt_fixed('%s') (%s): expected num=%d, got %d",
+               cases[i].input, cases[i].label, cases[i].expect_num, num);
+      TEST_ASSERT(0, msg);
+    }
+  }
+
+  /* Regression pin: the buggy copy wrongly accepts trailing garbage. */
+  int num = 0;
+  char mixed[] = "2xyz";
+  TEST_ASSERT(parseInt_buggy(mixed, &num) == 1 && num == 2,
+    "parseInt_buggy('2xyz') accepts trailing garbage as 2 (the bug)");
+
+  TEST_PASS();
+}
+
+/* =========================================================================
  * Test runner
  * ========================================================================= */
 
@@ -437,6 +543,8 @@ static TestCase test_cases[] = {
      "Table-driven safe hex parsing with endptr+errno"},
     {"division-guard", test_division_guard,
      "Table-driven division guard: color==0 skips, color>0 computes"},
+    {"parseInt-full-consume", test_parseInt_full_consume,
+     "Table-driven: fixed parseInt rejects trailing garbage (e.g. '2xyz')"},
     {NULL, NULL, NULL}
 };
 

@@ -1238,7 +1238,8 @@ static bool parseInt(char *s, int *num) {
     *num = (int)strtoul(start, &p, 0);
   }
 
-  if (p == start || errno == ERANGE)
+  while (*p && isspace(*p)) ++p;
+  if (p == start || *p != '\0' || errno == ERANGE)
     return false;
   return true;
 }
