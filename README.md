@@ -18,6 +18,12 @@ NCCL tests rely on MPI to work on multiple processes, hence multiple nodes. If y
 $ make MPI=1 MPI_HOME=/path/to/mpi CUDA_HOME=/path/to/cuda NCCL_HOME=/path/to/nccl
 ```
 
+In some distributions, MPI's header files may not reside in `$MPI_HOME/include`. In this case, you can set `MPI_INCLUDE` to the path where MPI's header files are installed. 
+
+```shell
+$ make MPI=1 MPI_HOME=/path/to/mpi MPI_INCLUDE=/path/to/mpi/headers CUDA_HOME=/path/to/cuda NCCL_HOME=/path/to/nccl
+```
+
 You can also add a suffix to the name of the generated binaries with `NAME_SUFFIX`. For example when compiling with the MPI versions you could use:
 
 ```shell
@@ -39,7 +45,7 @@ $ ./build/all_reduce_perf -b 8 -e 128M -f 2 -g 8
 ```
 
 Run 64 MPI processes on nodes with 8 GPUs each, for a total of 64 GPUs spread across 8 nodes.
-Scanning from 8 Bytes to 32GiB (Gibibytes), doubling between each test (`-f 2`).
+Scanning from 8 Bytes to 8GiB (Gibibytes), doubling between each test (`-f 2`).
 (NB: The nccl-tests binaries must be compiled with `MPI=1` for this case)
 
 ```shell
@@ -52,7 +58,7 @@ See the [Performance](doc/PERFORMANCE.md) page for explanation about numbers, an
 
 ### Arguments
 
-All tests support the same set of arguments :
+Collective perf tests support the same set of arguments :
 
 * Number of GPUs
   * `-t,--nthreads <num threads>` number of threads per process. Default : 1.
@@ -73,18 +79,31 @@ All tests support the same set of arguments :
   * `-m,--agg_iters <aggregation count>` number of operations to aggregate together in each iteration. Default : 1.
   * `-N,--run_cycles <cycle count>` run & print each cycle. Default : 1; 0=infinite.
   * `-a,--average <0/1/2/3>` Report performance as an average across all ranks (MPI=1 only). <0=Rank0,1=Avg,2=Min,3=Max>. Default : 1.
+  * `-I,--per_iter_timing <0/1>` collect per-iteration CUDA event timings and print summary columns.
+    `i_p99` uses nearest-rank percentile and may equal `i_max` with fewer than 100 samples.
+    Incompatible with CUDA graph capture (`-G`). Default : 0.
+  * `-K,--per_iter_skip <count>` exclude leading samples from `-I` summary statistics.
+    Raw per-iteration JSON data remains complete. Default : 0.
 * Test operation
   * `-p,--parallel_init <0/1>` use threads to initialize NCCL in parallel. Default : 0.
   * `-c,--check <check iteration count>` perform count iterations, checking correctness of results on each iteration. This can be quite slow on large numbers of GPUs. Default : 1.
-  * `-z,--blocking <0/1/2>` collective blocking: 1=wait for completion and barrier, 2=wait without barrier. Default : 0.
+  * `-z,--blocking <0/1/2/3>` collective blocking mode. Default: 0.
+    * `0` : non-blocking (default)
+    * `1` : wait and barrier after each inner iteration (`-m`)
+    * `2` : wait after each inner iteration, no barrier
+    * `3` : wait and barrier after each outer iteration (`-n`); reported time excludes barrier. Incompatible with CUDA graph capture (`-G`).
   * `-G,--cudagraph <num graph launches>` Capture iterations as a CUDA graph and then replay specified number of times. Default : 0.
   * `-C,--report_cputime <0/1>` Report CPU time instead of latency. Default : 0.
   * `-R,--local_register <0/1/2>` enable local (1) or symmetric (2) buffer registration on send/recv buffers. Default : 0.
+  * `-D,--device_implementation <implementation number>` use custom device API implementation. Not every collective has a custom device API implementations (currently just all\_reduce and alltoall). Default : 0 (use traditional NCCL host implementation). Note: values > 0 require symmetric memory registration (`-R 2`).
+  * `-H,--host_rma_implementation <num RMA contexts>` use host one-sided RMA (`ncclPutSignal`/`ncclWaitSignal`) instead of the built-in collective. Supported by sendrecv, alltoall, all\_gather, broadcast, gather, and scatter. `1` uses a single context; values `>1` distribute RMA traffic across contexts and require NCCL >= 2.31. Requires symmetric registration (`-R 2`). Mutually exclusive with `-D`.
+  * `-V,--device_cta_count <number>` number of CTAs for device API implementation. Must be positive and less than 128. Default : 16.
   * `-S,--report_timestamps <0/1>` Add timestamp (`"%Y-%m-%d %H:%M:%S"`) to each performance report line. Default : 0.
   * `-J,--output_file <file>` Write [JSON] output to filepath. Infer type from suffix (only `json` supported presently).
   * `-T,--timeout <time in seconds>` timeout each test after specified number of seconds. Default : disabled.
-  * `-M,--memory_report <0/1>` enable memory usage report. Default : 0.
+  * `-M,--memory <0/1>` enable memory usage report. Default : 0.
   * `-u,--unalign <index of first element>` Misalign source and destination buffers. Default : 0.
+  * `-U,--tuning <0/1>` report NCCL tuning information. Requires NCCL 2.28 or newer; symmetric collective identification and kernel variant reporting require NCCL 2.31 or newer. Default : 0.
 
 ### Running multiple operations in parallel
 
@@ -105,6 +124,24 @@ Here are a few examples:
 - `NCCL_TESTS_SPLIT="AND 0x1"` or `NCCL_TESTS_SPLIT="MOD 2"`: Run two operations, each operation using every other rank.
 
 Note that the reported bandwidth is per group, hence to get the total bandwidth used by all groups, one must multiply by the number of groups.
+
+### Communicator operations (`comm_ops_perf`)
+
+Benchmarks NCCL communicator init, split, shrink, and grow latency. Requires `MPI=1`; does not use the collective arguments above.
+
+```shell
+$ mpirun -np 8 ./build/comm_ops_perf init
+$ mpirun -np 8 ./build/comm_ops_perf split --sweep-comms fixed
+$ mpirun -np 8 ./build/comm_ops_perf grow --resize factor-1.5
+```
+
+Pass a test mode (`init`, `split`, `shrink`, or `grow`) followed by options such as `-i` (timed iterations), `-w` (untimed warmup iterations), `-s` / `-b` / `-e` (comm-size sweep), `-r` (resize for split/shrink/grow), `-S` (share resources), and `-a` (abort path). Output is per-operation latency summaries in ms; use `--help` for details.
+
+### GIN device API microbenchmarks (`device_api/gin`)
+
+Measures latency and bandwidth / message rate of NCCL GIN point-to-point device API operations (`put`, `get`, `signal`, and combined variants). Requires `MPI=1`, NCCL 2.30.7 or newer, and exactly 2 ranks (one GPU each). Against older NCCL these binaries are simply left out of the build.
+
+See [src/device_api/gin/README.md](src/device_api/gin/README.md) for the full list of benchmarks and their options.
 
 ## Copyright
 

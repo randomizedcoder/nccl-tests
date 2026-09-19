@@ -31,13 +31,45 @@ testResult_t BroadcastInitData(struct threadArgs* args, ncclDataType_t type, ncc
   return testSuccess;
 }
 
-void BroadcastGetBw(size_t count, int typesize, double sec, double* algBw, double* busBw, int nranks) {
+void BroadcastGetBw(size_t count, size_t typesize, double sec, double* algBw, double* busBw, int nranks) {
   double baseBw = (double)(count * typesize) / 1.0E9 / sec;
 
   *algBw = baseBw;
   double factor = 1;
   *busBw = baseBw * factor;
 }
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+testResult_t BroadcastRmaPut(void* sendWindow, size_t sendoffset, void* recvWindow, size_t recvoffset,
+                             size_t count, ncclDataType_t type, int root, ncclComm_t comm, cudaStream_t stream) {
+  int rank, nranks;
+  NCCLCHECK(ncclCommUserRank(comm, &rank));
+  NCCLCHECK(ncclCommCount(comm, &nranks));
+
+  ncclWindow_t sendWin = (ncclWindow_t)sendWindow;
+  ncclWindow_t recvWin = (ncclWindow_t)recvWindow;
+
+  void* sendPtr = NULL;
+  void* recvPtr = NULL;
+  NCCLCHECK(ncclWinGetUserPtr(comm, sendWin, &sendPtr));
+  NCCLCHECK(ncclWinGetUserPtr(comm, recvWin, &recvPtr));
+
+  const int nctx = rmaCtxCount;
+
+  NCCLCHECK(ncclGroupStart());
+  if (rank == root) {
+    for (int peer = 0; peer < nranks; peer++) {
+      NCCLCHECK(ncclPutSignal((char*)sendPtr + sendoffset, count, type, peer,
+                        recvWin, recvoffset, peer % NUM_RMA_SIG, (rank + peer) % nctx, 0, comm, stream));
+    }
+  }
+  NCCLCHECK(ncclGroupEnd());
+
+  ncclWaitSignalDesc_t waitDesc = {1, root, rank % NUM_RMA_SIG, (root + rank) % nctx};
+  NCCLCHECK(ncclWaitSignal(1, &waitDesc, comm, stream));
+  return testSuccess;
+}
+#endif
 
 testResult_t BroadcastRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, int deviceImpl) {
   if (deviceImpl == 0) {
@@ -54,6 +86,10 @@ testResult_t BroadcastRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
     } else {
       NCCLCHECK(ncclBcast(rptr, count, type, root, comm, stream));
     }
+#endif
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+  } else if (deviceImpl == HOST_RMA_IMPL) {
+    TESTCHECK(BroadcastRmaPut(sendbuff, sendoffset, recvbuff, recvoffset, count, type, root, comm, stream));
 #endif
   } else {
     return testNotImplemented;
@@ -106,9 +142,7 @@ testResult_t BroadcastRunTest(struct threadArgs* args, int root, ncclDataType_t 
   return testSuccess;
 }
 
-struct testEngine broadcastEngine = {
-  .getBuffSize = BroadcastGetBuffSize,
-  .runTest = BroadcastRunTest
+NCCL_WEAK struct testEngine ncclTestEngine = {
+  /* .getBuffSize = */ BroadcastGetBuffSize,
+  /* .runTest = */ BroadcastRunTest
 };
-
-#pragma weak ncclTestEngine=broadcastEngine

@@ -16,13 +16,24 @@
 // except some of the usual ones.
 
 #include "nccl.h"
+#include "nccl_profiler.h"
 #include "util.h"
+#include "nccl_tests_git_version.h"
+#include "os.h"
 #include <assert.h>
 #include <errno.h>
+#include <cmath>
+#include <algorithm>
+#include <cstring>
 #include <string>
+#include <sstream>
 #include <iomanip>
+#include <atomic>
 
-#define PRINT if (is_main_thread) printf
+#define PRINT(...) \
+  do { \
+    if (is_main_thread) printf(__VA_ARGS__); \
+  } while (0)
 
 extern int nThreads;
 extern int nGpus;
@@ -36,13 +47,56 @@ extern int iters;
 extern int agg_iters;
 extern int parallel_init;
 extern int blocking_coll;
+extern int per_iter_timing;
+extern int per_iter_skip;
 extern int cudaGraphLaunches;
 extern int unalign;
+extern int tuning;
 
 static FILE *json_report_fp;
 static thread_local bool write_json;
 
-#define JSON_FILE_VERSION 1
+struct groupEvent {
+  uint64_t type;
+  std::atomic<int> count;
+};
+
+struct taskEvent {
+  uint64_t type;
+  std::atomic<int> count;
+  std::atomic<bool> ready;
+  union {
+    struct {
+      const char* implementation;
+      const char* algo;
+      const char* proto;
+      const char* kernelVariant;
+      int nChannels;
+      uint8_t nWarps;
+    } coll;
+
+    struct {
+      uint8_t nChannels;
+    } p2p;
+
+    struct {
+      const char* syncStrategy;
+    } ce;
+  };
+};
+
+struct proxyEvent {
+  uint64_t type;
+  std::atomic<int> count;
+  std::atomic<bool> ready;
+  int chunkSize;
+};
+
+static struct groupEvent group;
+static struct taskEvent task;
+static struct proxyEvent proxy;
+
+#define JSON_FILE_VERSION 4
 
 #define TIME_STRING_FORMAT "%Y-%m-%d %H:%M:%S"
 
@@ -232,6 +286,24 @@ static void jsonNull() {
   fprintf(json_report_fp, "null");
 }
 
+static void jsonFinishCurrent() {
+  switch(jsonCurrState()) {
+  case JSON_KEY:
+    jsonNull();
+    break;
+  case JSON_OBJECT_EMPTY:
+  case JSON_OBJECT_SOME:
+    jsonFinishObject();
+    break;
+  case JSON_LIST_EMPTY:
+  case JSON_LIST_SOME:
+    jsonFinishList();
+    break;
+  default:
+    assert(0);
+  }
+}
+
 // Write a (sanititzed) string
 static void jsonStr(const char *str) {
   if(str == nullptr) {
@@ -314,7 +386,7 @@ void jsonOutputInit(const char *in_path,
       return;
     }
     free(try_path);
-    if(asprintf(&try_path, "%s.%d", in_path, try_count++) == -1) {
+    if(ncclTestAsprintf(&try_path, "%s.%d", in_path, try_count++) == -1) {
       printf("# skipping json output; failed to probe destination\n");
       return;
     }
@@ -362,12 +434,17 @@ void jsonIdentifyWriter(bool is_writer) {
 void jsonOutputFinalize() {
   if(write_json) {
 
-    jsonKey("end_time");
-    char timebuffer[128];
-    formatNow(timebuffer, sizeof(timebuffer));
-    jsonStr(timebuffer);
+    if(state_n == 1 &&
+       (jsonCurrState() == JSON_OBJECT_EMPTY || jsonCurrState() == JSON_OBJECT_SOME)) {
+      jsonKey("end_time");
+      char timebuffer[128];
+      formatNow(timebuffer, sizeof(timebuffer));
+      jsonStr(timebuffer);
+    }
 
-    jsonFinishObject();
+    while(state_n > 0) {
+      jsonFinishCurrent();
+    }
 
     assert(jsonCurrState() == JSON_NONE);
     free(states);
@@ -438,12 +515,62 @@ void writeBenchmarkLinePreamble(size_t nBytes, size_t nElem, const char typeName
 
 // Finish a result record we were writing to stdout/json
 void writeBenchmarkLineTerminator(int actualIters, const char *name) {
+  const bool taskReady = task.ready.load(std::memory_order_acquire);
+  const bool proxyReady = proxy.ready.load(std::memory_order_acquire);
+  const char* implementation = "N/A";
+  const char* algo = "N/A";
+  const char* proto = "N/A";
+  const char* kernelVariant = "N/A";
+  const char* syncStrategy = "N/A";
+  int nChannels = -1;
+  int nWarps = -1;
+
+  if (taskReady) {
+    if (task.type == ncclProfileColl) {
+      implementation = task.coll.implementation;
+      algo = task.coll.algo;
+      proto = task.coll.proto;
+      kernelVariant = task.coll.kernelVariant;
+      nChannels = task.coll.nChannels;
+      nWarps = task.coll.nWarps;
+    } else if (task.type == ncclProfileP2p) {
+      implementation = "P2P";
+      nChannels = task.p2p.nChannels;
+    } else if (task.type == ncclProfileCeColl) {
+      implementation = "CE";
+      syncStrategy = task.ce.syncStrategy;
+    }
+  }
+
+  if (tuning) {
+    PRINT("  %-4s  %-14s  %-8s  %-18s  %-8s", implementation, algo, proto, kernelVariant, syncStrategy);
+    if (nChannels >= 0) PRINT("  %-9d", nChannels);
+    else PRINT("  %-9s", "N/A");
+    if (nWarps >= 0) PRINT("  %-6d", nWarps);
+    else PRINT("  %-6s", "N/A");
+    if (proxyReady) PRINT("  %-12d", proxy.chunkSize);
+    else PRINT("  %-12s", "N/A");
+  }
   PRINT("\n");
   if(write_json) {
+    if (tuning) {
+      jsonKey("tuning"); jsonStartObject();
+      jsonKey("implementation"); jsonStr(implementation);
+      jsonKey("algo"); jsonStr(algo);
+      jsonKey("proto"); jsonStr(proto);
+      jsonKey("kernelVariant"); jsonStr(kernelVariant);
+      jsonKey("syncStrategy"); jsonStr(syncStrategy);
+      jsonKey("#channels"); nChannels >= 0 ? jsonInt(nChannels) : jsonStr("N/A");
+      jsonKey("#warps"); nWarps >= 0 ? jsonInt(nWarps) : jsonStr("N/A");
+      jsonKey("netChunkSize"); proxyReady ? jsonInt(proxy.chunkSize) : jsonStr("N/A");
+      jsonFinishObject();
+    }
     jsonKey("actual_iterations"); jsonInt(actualIters);
     jsonKey("experiment_name");   jsonStr(name);
     jsonFinishObject();
   }
+  task.ready.store(false, std::memory_order_relaxed);
+  proxy.ready.store(false, std::memory_order_relaxed);
 }
 
 // Handle a cases where we don't write out of place results
@@ -455,15 +582,10 @@ void writeBenchMarkLineNullBody() {
 }
 
 void getFloatStr(double value, int width, char* str) {
-  int power = 0;
-  for (uint64_t val = 1; value >= val; val *= 10) power++;
-
-  if (power < width-2) sprintf(str, "%*.2f", width, value);
-  else if (power < width-1) sprintf(str, "%*.1f", width, value);
-  else if (power < width+1) sprintf(str, "%*.0f", width, value);
-  else if (width >= 7) sprintf(str, "%*.1e", width, value);
-  else if (width >= 8) sprintf(str, "%*.2e", width, value);
-  else sprintf(str, "%*.0e", width, value);
+  if (snprintf(str, width+1, "%*.2f", width, value) <= width) return;
+  if (snprintf(str, width+1, "%*.1f", width, value) <= width) return;
+  if (snprintf(str, width+1, "%*.0f", width, value) <= width) return;
+  snprintf(str, width+1, width >= 7 ? "%*.1e" : "%*.0e", width, value);
 }
 
 // Write the performance-related payload to stdout/json.
@@ -485,11 +607,7 @@ void writeBenchmarkLineBody(double timeUsec, double algBw, double busBw, bool re
     PRINT("  %7s  %6s  %6s    N/A", timeStr, algBwStr, busBwStr);
   }
 
-  if (!out_of_place && report_timestamps) {
-    char timebuffer[128];
-    formatNow(timebuffer, sizeof(timebuffer));
-    PRINT("%21s", timebuffer);
-  }
+  if (!out_of_place && report_timestamps && !per_iter_timing) writeTimestamp();
 
   if(write_json) {
     jsonKey(out_of_place ? "out_of_place" : "in_place");
@@ -500,6 +618,92 @@ void writeBenchmarkLineBody(double timeUsec, double algBw, double busBw, bool re
     jsonKey("nwrong");                             (reportErrors ? jsonDouble((double)wrongElts) : jsonNull());
     jsonFinishObject();
   }
+}
+
+static int cmpDouble(const void* a, const void* b) {
+  double da = *(const double*)a, db = *(const double*)b;
+  return (da > db) - (da < db);
+}
+
+static int percentileIndex(int n, int percentile) {
+  return std::min(n - 1, (n * percentile + 99) / 100 - 1);
+}
+
+void computeIterStats(const double* times, int n, struct IterStats* stats) {
+  double* sorted = (double*)malloc(n * sizeof(double));
+  memcpy(sorted, times, n * sizeof(double));
+  qsort(sorted, n, sizeof(double), cmpDouble);
+
+  stats->min = sorted[0];
+  stats->max = sorted[n - 1];
+  stats->p50 = sorted[n / 2];
+  stats->p95 = sorted[percentileIndex(n, 95)];
+  stats->p99 = sorted[percentileIndex(n, 99)];
+
+  double sum = 0;
+  for (int i = 0; i < n; i++) sum += sorted[i];
+  stats->avg = sum / n;
+
+  double var = 0;
+  for (int i = 0; i < n; i++) {
+    double d = sorted[i] - stats->avg;
+    var += d * d;
+  }
+  stats->stdev = sqrt(var / n);
+  free(sorted);
+}
+
+void writePerIterReport(const struct IterStats* stats, const double* iterTimes, int nIters, int skippedIters, bool out_of_place, const double* allProcessTimes, int nProcs) {
+  double cvPct = stats->avg > 0 ? (stats->stdev / stats->avg) * 100.0 : 0.0;
+
+  char minStr[8], maxStr[8], p99Str[8], cvStr[8];
+  getFloatStr(stats->min * 1e6, 7, minStr);
+  getFloatStr(stats->max * 1e6, 7, maxStr);
+  getFloatStr(stats->p99 * 1e6, 7, p99Str);
+  getFloatStr(cvPct, 7, cvStr);
+
+  PRINT("  %7s  %7s  %7s  %7s", minStr, maxStr, p99Str, cvStr);
+
+  if (write_json) {
+    const char* key = out_of_place ? "out_of_place_per_iter" : "in_place_per_iter";
+    jsonKey(key);
+    jsonStartObject();
+    jsonKey("skipped_iterations"); jsonInt(skippedIters);
+    jsonKey("min_us");   jsonDouble(stats->min * 1e6);
+    jsonKey("max_us");   jsonDouble(stats->max * 1e6);
+    jsonKey("avg_us");   jsonDouble(stats->avg * 1e6);
+    jsonKey("p50_us");   jsonDouble(stats->p50 * 1e6);
+    jsonKey("p95_us");   jsonDouble(stats->p95 * 1e6);
+    jsonKey("p99_us");   jsonDouble(stats->p99 * 1e6);
+    jsonKey("stdev_us"); jsonDouble(stats->stdev * 1e6);
+    jsonKey("cv_pct");   jsonDouble(cvPct);
+    jsonKey("times_us"); jsonStartList();
+    for (int i = 0; i < nIters; i++) {
+      jsonDouble(iterTimes[i] * 1e6);
+    }
+    jsonFinishList();
+
+    if (allProcessTimes && nProcs > 1) {
+      jsonKey("per_process_max_times_us");
+      jsonStartList();
+      for (int r = 0; r < nProcs; r++) {
+        jsonStartList();
+        for (int i = 0; i < nIters; i++) {
+          jsonDouble(allProcessTimes[r * nIters + i] * 1e6);
+        }
+        jsonFinishList();
+      }
+      jsonFinishList();
+    }
+
+    jsonFinishObject();
+  }
+}
+
+void writeTimestamp() {
+  char timebuffer[128];
+  formatNow(timebuffer, sizeof(timebuffer));
+  PRINT("%21s", timebuffer);
 }
 
 // This writes out a report about the run parameters and devices
@@ -513,14 +717,23 @@ void writeBenchmarkLineBody(double timeUsec, double algBw, double busBw, bool re
 // strings would be smarter/easier, but I chose to adapt what was
 // already in place.
 testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int totalProcs, int color, const char hostname[], const char *program_name) {
-  PRINT("# nccl-tests version %s nccl-headers=%d nccl-library=%d\n", NCCL_TESTS_VERSION, NCCL_VERSION_CODE, test_ncclVersion);
+  PRINT("# nccl-tests version %s (%s) nccl-headers=%d nccl-library=%d\n",
+        NCCL_TESTS_VERSION, NCCL_TESTS_GIT_VERSION, NCCL_VERSION_CODE, test_ncclVersion);
   PRINT("# Collective test starting: %s\n", program_name);
   PRINT("# nThread %d nGpus %d minBytes %ld maxBytes %ld step: %ld(%s) warmup iters: %d iters: %d agg iters: %d validation: %d graph: %d unalign: %d\n",
         nThreads, nGpus, minBytes, maxBytes,
         (stepFactor > 1)?stepFactor:stepBytes, (stepFactor > 1)?"factor":"bytes",
         warmup_iters, iters, agg_iters, datacheck, cudaGraphLaunches, unalign);
-  if (blocking_coll == 1) PRINT("# Blocking Enabled: wait for completion and barrier after each collective \n");
-  if (blocking_coll > 1)  PRINT("# Blocking Enabled: wait for completion after each collective (no barrier) \n");
+  if (blocking_coll == 1) PRINT("# Blocking Enabled: wait and barrier after each inner iteration (-m) \n");
+  if (blocking_coll == 2) PRINT("# Blocking Enabled: wait after each inner iteration (-m), no barrier \n");
+  if (blocking_coll == 3)
+    PRINT("# Blocking Enabled: wait and barrier after each outer iteration (-n); "
+          "time excludes barrier \n");
+  if (per_iter_timing) {
+    PRINT("# Per-Iteration Report: CUDA event timing; i_* uses max over process rows");
+    if (per_iter_skip) PRINT("; summary skips first %d iterations", per_iter_skip);
+    PRINT(" \n");
+  }
   if (parallel_init) PRINT("# Parallel Init Enabled: threads call into NcclInitRank concurrently \n");
   PRINT("#\n");
 
@@ -532,7 +745,7 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     jsonKey("minimum_bytes"); jsonSize_t(minBytes);
     jsonKey("maximum_bytes"); jsonSize_t(maxBytes);
     if(stepFactor > 1) {
-      jsonKey("step_factor");   jsonInt(stepFactor);
+      jsonKey("step_factor");   jsonSize_t(stepFactor);
     }
     else {
       jsonKey("step_bytes");  jsonSize_t(stepBytes);
@@ -544,6 +757,8 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     jsonKey("validation");            jsonInt(datacheck);
     jsonKey("graph");                 jsonInt(cudaGraphLaunches);
     jsonKey("blocking_collectives");  jsonBool(blocking_coll);
+    jsonKey("per_iter_timing");     jsonBool(per_iter_timing);
+    jsonKey("per_iter_skip");       jsonInt(per_iter_skip);
     jsonKey("parallel_init");         jsonBool(parallel_init);
   }
 
@@ -568,7 +783,7 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     CUDACHECK(cudaGetDeviceProperties(&prop, cudaDev));
     if (len < MAX_LINE) {
       len += snprintf(line+len, MAX_LINE-len, "#  Rank %2d Group %2d Pid %6d on %10s device %2d [%04x:%02x:%02x] %s\n",
-                      rank, color, getpid(), hostname, cudaDev, prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, prop.name);
+                      rank, color, ncclTestGetPid(), hostname, cudaDev, prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, prop.name);
     }
     *maxMem = std::min(*maxMem, prop.totalGlobalMem);
   }
@@ -621,15 +836,53 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
 // Json results object and contained table list are left open
 void writeResultHeader(bool report_cputime, bool report_timestamps) {
   const char* tsLbl  = report_timestamps ? "timestamp" : "";
-  const int tsPad = report_timestamps ? 19 : 0;
+  const int tsPad = report_timestamps ? 21 : 0;
   const char* tsFmt = report_timestamps ? TIME_STRING_FORMAT : "";
   const char* timeStr = report_cputime ? "cputime" : "time";
   PRINT("#\n");
-  PRINT("# %10s  %12s  %8s  %6s  %6s           out-of-place                       in-place          \n", "", "", "", "", "");
-  PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s  %6s  %7s  %6s  %6s  %6s %*s\n", "size", "count", "type", "redop", "root",
-        timeStr, "algbw", "busbw", "#wrong", timeStr, "algbw", "busbw", "#wrong", tsPad, tsLbl);
-  PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s  %6s  %7s  %6s  %6s  %6s %*s\n", "(B)", "(elements)", "", "", "",
-        "(us)", "(GB/s)", "(GB/s)", "", "(us)", "(GB/s)", "(GB/s)", "", tsPad, tsFmt);
+  if (per_iter_timing) {
+    PRINT("# %10s  %12s  %8s  %6s  %6s              out-of-place (+ per-iteration)                                in-place (+ per-iteration)%*s",
+          "", "", "", "", "", tsPad, "");
+    if (tuning) {
+      PRINT("%87s%44s", "tuning", "");
+    }
+    PRINT("\n");
+    PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s  %6s  %7s  %7s  %7s  %7s  %7s  %6s  %6s  %6s  %7s  %7s  %7s  %7s%*s",
+          "size", "count", "type", "redop", "root",
+          timeStr, "algbw", "busbw", "#wrong", "i_min", "i_max", "i_p99", "i_cv%",
+          timeStr, "algbw", "busbw", "#wrong", "i_min", "i_max", "i_p99", "i_cv%", tsPad, tsLbl);
+    if (tuning) {
+      PRINT("  %-4s  %-14s  %-8s  %-18s  %-8s  %-9s  %-6s  %-12s", "impl", "algo", "proto", "kernelVariant", "sync", "#channels", "#warps", "netChunkSize");
+    }
+    PRINT("\n");
+    PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s  %6s  %7s  %7s  %7s  %7s  %7s  %6s  %6s  %6s  %7s  %7s  %7s  %7s%*s",
+          "(B)", "(elements)", "", "", "",
+          "(us)", "(GB/s)", "(GB/s)", "", "(us)", "(us)", "(us)", "(%)",
+          "(us)", "(GB/s)", "(GB/s)", "", "(us)", "(us)", "(us)", "(%)", tsPad, tsFmt);
+    if (tuning) {
+      PRINT("  %-4s  %-14s  %-8s  %-18s  %-8s  %-9s  %-6s  %-12s", "", "", "", "", "", "", "", "");
+    }
+    PRINT("\n");
+  } else {
+    PRINT("# %10s  %12s  %8s  %6s  %6s           out-of-place                       in-place%*s",
+          "", "", "", "", "", tsPad, "");
+    if (tuning) {
+      PRINT("%63s%44s", "tuning", "");
+    }
+    PRINT("\n");
+    PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s  %6s  %7s  %6s  %6s  %6s%*s", "size", "count", "type", "redop", "root",
+          timeStr, "algbw", "busbw", "#wrong", timeStr, "algbw", "busbw", "#wrong", tsPad, tsLbl);
+    if (tuning) {
+      PRINT("  %-4s  %-14s  %-8s  %-18s  %-8s  %-9s  %-6s  %-12s", "impl", "algo", "proto", "kernelVariant", "sync", "#channels", "#warps", "netChunkSize");
+    }
+    PRINT("\n");
+    PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s  %6s  %7s  %6s  %6s  %6s%*s", "(B)", "(elements)", "", "", "",
+          "(us)", "(GB/s)", "(GB/s)", "", "(us)", "(GB/s)", "(GB/s)", "", tsPad, tsFmt);
+    if (tuning) {
+      PRINT("  %-4s  %-14s  %-8s  %-18s  %-8s  %-9s  %-6s  %-12s", "", "", "", "", "", "", "", "");
+    }
+    PRINT("\n");
+  }
 
   if(write_json) {
     jsonKey("results"); jsonStartList();
@@ -664,7 +917,8 @@ void writeResultFooter(const int errors[], const double bw[], double check_avg_b
   }
 }
 
-std::string getMemString(double amount) {
+std::string getMemString(int64_t amountBytes) {
+  double amount = static_cast<double>(amountBytes);
   std::string postfix = " B";
   if (abs(amount) >= 1024.0*1024.0*1024.0) {
     postfix = " GB";
@@ -725,3 +979,179 @@ void writeErrors() {
 void finalizeFooter() {
   PRINT("#\n");
 }
+
+static int profilerContext;
+
+static ncclResult_t ncclProfilerInit(void** ctx, uint64_t id, int* eMask, const char* name, int nodes, int ranks, int rank, ncclDebugLogger_t logfn) {
+  *ctx = &profilerContext;
+  *eMask = (ncclProfileColl | ncclProfileP2p | ncclProfileProxyOp | ncclProfileCeColl);
+  return ncclSuccess;
+}
+
+static void ncclProfilerStartCollEvent(void** eHandle, uint64_t type, const char* implementation, const char* algo,
+                                       const char* proto, const char* kernelVariant, uint8_t nChannels, uint8_t nWarps) {
+  if (task.count.fetch_add(1, std::memory_order_relaxed) == 0) {
+    task.type = type;
+    task.coll.implementation = implementation;
+    task.coll.algo = algo ? algo : "N/A";
+    task.coll.proto = proto ? proto : "N/A";
+    task.coll.kernelVariant = kernelVariant ? kernelVariant : "N/A";
+    task.coll.nChannels = nChannels == 0 ? -1 : nChannels;
+    task.coll.nWarps = nWarps;
+  }
+  *eHandle = &task;
+}
+
+static void ncclProfilerStartP2pEvent(void** eHandle, uint64_t type, uint8_t nChannels) {
+  if (task.count.fetch_add(1, std::memory_order_relaxed) == 0) {
+    task.type = type;
+    task.p2p.nChannels = nChannels;
+  }
+  *eHandle = &task;
+}
+
+static void ncclProfilerStartCeEvent(void** eHandle, uint64_t type, const char* syncStrategy) {
+  if (task.count.fetch_add(1, std::memory_order_relaxed) == 0) {
+    task.type = type;
+    task.ce.syncStrategy = syncStrategy ? syncStrategy : "N/A";
+  }
+  *eHandle = &task;
+}
+
+static void ncclProfilerStartProxyEvent(void** eHandle, uint64_t type, int chunkSize) {
+  // The chunk size is the same for all channels, so capture it only once.
+  if (proxy.count.fetch_add(1, std::memory_order_relaxed) == 0) {
+    proxy.type = type;
+    proxy.chunkSize = chunkSize;
+  }
+  *eHandle = &proxy;
+}
+
+template <typename EventDescr>
+static ncclResult_t ncclProfilerStartEventCommon(void** eHandle, EventDescr* eDescr) {
+  switch (eDescr->type) {
+    case ncclProfileGroup:
+      group.type = eDescr->type;
+      group.count.fetch_add(1, std::memory_order_relaxed);
+      *eHandle = &group;
+      break;
+    case ncclProfileP2p:
+      ncclProfilerStartP2pEvent(eHandle, eDescr->type, eDescr->p2p.nChannels);
+      break;
+    case ncclProfileProxyOp:
+      ncclProfilerStartProxyEvent(eHandle, eDescr->type, eDescr->proxyOp.chunkSize);
+      break;
+    default:;
+  }
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclProfilerStartEvent_v5(void*, void** eHandle, ncclProfilerEventDescr_v5_t* eDescr) {
+  if (eDescr->type == ncclProfileColl) {
+    ncclProfilerStartCollEvent(eHandle, eDescr->type, "GEN", eDescr->coll.algo, eDescr->coll.proto, nullptr,
+                               eDescr->coll.nChannels, eDescr->coll.nWarps);
+    return ncclSuccess;
+  }
+  return ncclProfilerStartEventCommon(eHandle, eDescr);
+}
+
+static ncclResult_t ncclProfilerStartEvent_v6(void*, void** eHandle, ncclProfilerEventDescr_v6_t* eDescr) {
+  if (eDescr->type == ncclProfileCeColl) {
+    ncclProfilerStartCeEvent(eHandle, eDescr->type, eDescr->ceColl.syncStrategy);
+    return ncclSuccess;
+  }
+  if (eDescr->type == ncclProfileColl) {
+    ncclProfilerStartCollEvent(eHandle, eDescr->type, "GEN", eDescr->coll.algo, eDescr->coll.proto, nullptr,
+                               eDescr->coll.nChannels, eDescr->coll.nWarps);
+    return ncclSuccess;
+  }
+  return ncclProfilerStartEventCommon(eHandle, eDescr);
+}
+
+static ncclResult_t ncclProfilerStartEvent_v7(void*, void** eHandle, ncclProfilerEventDescr_v7_t* eDescr) {
+  if (eDescr->type == ncclProfileColl) {
+    const char* kernelVariant = eDescr->coll.isSymColl ? eDescr->coll.kernelVariant : nullptr;
+    if (kernelVariant && eDescr->coll.func) {
+      size_t len = strlen(eDescr->coll.func);
+      if (strncmp(kernelVariant, eDescr->coll.func, len) == 0 && kernelVariant[len] == '_') kernelVariant += len + 1;
+    }
+    ncclProfilerStartCollEvent(eHandle, eDescr->type, eDescr->coll.isSymColl ? "SYM" : "GEN",
+                               eDescr->coll.isSymColl ? "N/A" : eDescr->coll.algo,
+                               eDescr->coll.isSymColl ? "N/A" : eDescr->coll.proto, kernelVariant,
+                               eDescr->coll.nChannels, eDescr->coll.nWarps);
+    return ncclSuccess;
+  }
+  if (eDescr->type == ncclProfileCeColl) {
+    ncclProfilerStartCeEvent(eHandle, eDescr->type, eDescr->ceColl.syncStrategy);
+    return ncclSuccess;
+  }
+  return ncclProfilerStartEventCommon(eHandle, eDescr);
+}
+
+static ncclResult_t ncclProfilerStopEvent(void* eHandle) {
+  uint64_t type = *(uint64_t *)eHandle;
+  switch (type) {
+    case ncclProfileGroup: {
+      struct groupEvent* e = (struct groupEvent *)eHandle;
+      e->count.fetch_sub(1, std::memory_order_relaxed);
+    } break;
+    case ncclProfileColl:
+    case ncclProfileP2p:
+    case ncclProfileCeColl: {
+      struct taskEvent* e = (struct taskEvent *)eHandle;
+      if (e->count.fetch_sub(1, std::memory_order_relaxed) == 1)
+        e->ready.store(true, std::memory_order_release);
+    } break;
+    case ncclProfileProxyOp: {
+      struct proxyEvent* e = (struct proxyEvent *)eHandle;
+      if (e->count.fetch_sub(1, std::memory_order_relaxed) == 1)
+        e->ready.store(true, std::memory_order_release);
+    } break;
+    default:;
+  }
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclProfilerRecordEventState_v5(void* eHandle, ncclProfilerEventState_v5_t eState, ncclProfilerEventStateArgs_v5_t* eStateArgs) {
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclProfilerRecordEventState_v6(void* eHandle, ncclProfilerEventState_v6_t eState, ncclProfilerEventStateArgs_v6_t* eStateArgs) {
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclProfilerRecordEventState_v7(void* eHandle, ncclProfilerEventState_v7_t eState, ncclProfilerEventStateArgs_v7_t* eStateArgs) {
+  return ncclSuccess;
+}
+
+static ncclResult_t ncclProfilerFinalize(void* ctx) {
+  return ncclSuccess;
+}
+
+// perftest exposes profiler interface to nccl
+ncclProfiler_v5_t ncclProfiler_v5 = {
+  /* .name = */ "perftest",
+  /* .init = */ ncclProfilerInit,
+  /* .startEvent = */ ncclProfilerStartEvent_v5,
+  /* .stopEvent = */ ncclProfilerStopEvent,
+  /* .recordEventState = */ ncclProfilerRecordEventState_v5,
+  /* .finalize = */ ncclProfilerFinalize,
+};
+
+ncclProfiler_v6_t ncclProfiler_v6 = {
+  /* .name = */ "perftest",
+  /* .init = */ ncclProfilerInit,
+  /* .startEvent = */ ncclProfilerStartEvent_v6,
+  /* .stopEvent = */ ncclProfilerStopEvent,
+  /* .recordEventState = */ ncclProfilerRecordEventState_v6,
+  /* .finalize = */ ncclProfilerFinalize,
+};
+
+ncclProfiler_v7_t ncclProfiler_v7 = {
+  /* .name = */ "perftest",
+  /* .init = */ ncclProfilerInit,
+  /* .startEvent = */ ncclProfilerStartEvent_v7,
+  /* .stopEvent = */ ncclProfilerStopEvent,
+  /* .recordEventState = */ ncclProfilerRecordEventState_v7,
+  /* .finalize = */ ncclProfilerFinalize,
+};

@@ -8,7 +8,7 @@
 #include "common.h"
 
 void AllGatherGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
-  size_t base = (count/nranks) & -(16/eltSize);
+  size_t base = (count/nranks) & ~(16/eltSize - 1);
   *sendcount = base;
   *recvcount = base*nranks;
   *sendInplaceOffset = base;
@@ -35,7 +35,7 @@ testResult_t AllGatherInitData(struct threadArgs* args, ncclDataType_t type, ncc
   return testSuccess;
 }
 
-void AllGatherGetBw(size_t count, int typesize, double sec, double* algBw, double* busBw, int nranks) {
+void AllGatherGetBw(size_t count, size_t typesize, double sec, double* algBw, double* busBw, int nranks) {
   double baseBw = (double)(count * typesize * nranks) / 1.0E9 / sec;
 
   *algBw = baseBw;
@@ -43,11 +43,71 @@ void AllGatherGetBw(size_t count, int typesize, double sec, double* algBw, doubl
   *busBw = baseBw * factor;
 }
 
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+testResult_t AllGatherRmaPut(void* sendWindow, size_t sendoffset, void* recvWindow, size_t recvoffset,
+                             size_t count, ncclDataType_t type, ncclComm_t comm, cudaStream_t stream) {
+  int rank, nranks;
+  NCCLCHECK(ncclCommUserRank(comm, &rank));
+  NCCLCHECK(ncclCommCount(comm, &nranks));
+
+  ncclWindow_t sendWin = (ncclWindow_t)sendWindow;
+  ncclWindow_t recvWin = (ncclWindow_t)recvWindow;
+
+  void* sendPtr = NULL;
+  void* recvPtr = NULL;
+  NCCLCHECK(ncclWinGetUserPtr(comm, sendWin, &sendPtr));
+  NCCLCHECK(ncclWinGetUserPtr(comm, recvWin, &recvPtr));
+
+  size_t eltSize = wordSize(type);
+  size_t bytes = count * eltSize;
+  const int nctx = rmaCtxCount;
+
+  bool isInPlace = ((char*)sendPtr + sendoffset == (char*)recvPtr + recvoffset + rank * bytes);
+  size_t peerWinOffset = recvoffset + rank * bytes;
+
+  ncclWaitSignalDesc_t* waitDescs = (ncclWaitSignalDesc_t*)malloc(sizeof(ncclWaitSignalDesc_t) * nranks);
+  if (waitDescs == NULL) {
+    return testInternalError;
+  }
+
+  int descIdx = 0;
+  for (int i = 0; i < nranks; i++) {
+    if (isInPlace && i == rank) {
+      continue;
+    }
+    waitDescs[descIdx].opCnt = 1;
+    waitDescs[descIdx].peer = i;
+    waitDescs[descIdx].sigIdx = i % NUM_RMA_SIG;
+    waitDescs[descIdx].ctx = (i + rank) % nctx;
+    descIdx++;
+  }
+
+  NCCLCHECK(ncclGroupStart());
+  for (int peer = 0; peer < nranks; peer++) {
+    int targetRank = (rank + peer) % nranks;
+    if (isInPlace && targetRank == rank) {
+      continue;
+    }
+    NCCLCHECK(ncclPutSignal((char*)sendPtr + sendoffset, count, type, targetRank,
+                      recvWin, peerWinOffset, rank % NUM_RMA_SIG, (rank + targetRank) % nctx, 0, comm, stream));
+  }
+  NCCLCHECK(ncclGroupEnd());
+
+  NCCLCHECK(ncclWaitSignal(descIdx, waitDescs, comm, stream));
+  free(waitDescs);
+  return testSuccess;
+}
+#endif
+
 testResult_t AllGatherRunColl(void* sendbuff,  size_t sendoffset,void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, int deviceImpl) {
   if (deviceImpl == 0) {
     char* sptr = (char*)sendbuff + sendoffset;
     char* rptr = (char*)recvbuff + recvoffset;
     NCCLCHECK(ncclAllGather(sptr, rptr, count, type, comm, stream));
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+  } else if (deviceImpl == HOST_RMA_IMPL) {
+    TESTCHECK(AllGatherRmaPut(sendbuff, sendoffset, recvbuff, recvoffset, count, type, comm, stream));
+#endif
   } else {
     return testNotImplemented;
   }
@@ -89,9 +149,7 @@ testResult_t AllGatherRunTest(struct threadArgs* args, int root, ncclDataType_t 
   return testSuccess;
 }
 
-struct testEngine allGatherEngine = {
-  .getBuffSize = AllGatherGetBuffSize,
-  .runTest = AllGatherRunTest
+NCCL_WEAK struct testEngine ncclTestEngine = {
+  /* .getBuffSize = */ AllGatherGetBuffSize,
+  /* .runTest = */ AllGatherRunTest
 };
-
-#pragma weak ncclTestEngine=allGatherEngine

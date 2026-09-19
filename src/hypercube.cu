@@ -10,7 +10,7 @@
 #define ALIGN 4
 
 void HyperCubeGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
-  size_t base = (count/nranks) & -(16/eltSize);
+  size_t base = (count/nranks) & ~(16/eltSize - 1);
   *sendcount = base;
   *recvcount = base*nranks;
   *sendInplaceOffset = base;
@@ -37,7 +37,7 @@ testResult_t HyperCubeInitData(struct threadArgs* args, ncclDataType_t type, ncc
   return testSuccess;
 }
 
-void HyperCubeGetBw(size_t count, int typesize, double sec, double* algBw, double* busBw, int nranks) {
+void HyperCubeGetBw(size_t count, size_t typesize, double sec, double* algBw, double* busBw, int nranks) {
   double baseBw = (double)(count * typesize * (nranks - 1)) / 1.0E9 / sec;
 
   *algBw = baseBw;
@@ -114,9 +114,7 @@ testResult_t HyperCubeRunTest(struct threadArgs* args, int root, ncclDataType_t 
   return testSuccess;
 }
 
-struct testEngine hyperCubeEngine = {
-  .getBuffSize = HyperCubeGetBuffSize,
-  .runTest = HyperCubeRunTest
+NCCL_WEAK struct testEngine ncclTestEngine = {
+  /* .getBuffSize = */ HyperCubeGetBuffSize,
+  /* .runTest = */ HyperCubeRunTest
 };
-
-#pragma weak ncclTestEngine=hyperCubeEngine

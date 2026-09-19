@@ -35,13 +35,61 @@ testResult_t SendRecvInitData(struct threadArgs* args, ncclDataType_t type, nccl
   return testSuccess;
 }
 
-void SendRecvGetBw(size_t count, int typesize, double sec, double* algBw, double* busBw, int nranks) {
+void SendRecvGetBw(size_t count, size_t typesize, double sec, double* algBw, double* busBw, int nranks) {
   double baseBw = (double)(count * typesize) / 1.0E9 / sec;
 
   *algBw = baseBw;
   double factor = 1;
   *busBw = baseBw * factor;
 }
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+testResult_t SendRecvRmaPut(void* sendWindow, size_t sendoffset, void* recvWindow, size_t recvoffset,
+                            size_t count, ncclDataType_t type, ncclComm_t comm, cudaStream_t stream) {
+  int rank, nranks;
+  NCCLCHECK(ncclCommUserRank(comm, &rank));
+  NCCLCHECK(ncclCommCount(comm, &nranks));
+
+  int recvPeer = (rank - 1 + nranks) % nranks;
+  int sendPeer = (rank + 1) % nranks;
+
+  ncclWindow_t sendWin = (ncclWindow_t)sendWindow;
+  ncclWindow_t recvWin = (ncclWindow_t)recvWindow;
+
+  void* sendPtr = NULL;
+  void* recvPtr = NULL;
+  NCCLCHECK(ncclWinGetUserPtr(comm, sendWin, &sendPtr));
+  NCCLCHECK(ncclWinGetUserPtr(comm, recvWin, &recvPtr));
+
+  // Split the message into near-equal chunks round-robin across the RMA contexts
+  // provisioned by -H: chunk c goes to context c.
+  const size_t eltSize = wordSize(type);
+  const int nctx = rmaCtxCount;
+  const size_t base = count / nctx;
+  const size_t rem  = count % nctx;
+
+  NCCLCHECK(ncclGroupStart());
+  size_t elemOff = 0;
+  for (int c = 0; c < nctx; c++) {
+    size_t chunk = base + ((size_t)c < rem ? 1 : 0);
+    if (chunk == 0) continue;
+    size_t byteOff = elemOff * eltSize;
+    NCCLCHECK(ncclPutSignal((char*)sendPtr + sendoffset + byteOff, chunk, type, sendPeer,
+                      recvWin, recvoffset + byteOff, c % NUM_RMA_SIG, c, 0, comm, stream));
+    elemOff += chunk;
+  }
+  NCCLCHECK(ncclGroupEnd());
+
+  for (int c = 0; c < nctx; c++) {
+    size_t chunk = base + ((size_t)c < rem ? 1 : 0);
+    if (chunk == 0) continue;
+    ncclWaitSignalDesc_t waitDesc = {1, recvPeer, c % NUM_RMA_SIG, c};
+    NCCLCHECK(ncclWaitSignal(1, &waitDesc, comm, stream));
+  }
+
+  return testSuccess;
+}
+#endif
 
 testResult_t SendRecvRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, int deviceImpl) {
   if (deviceImpl == 0) {
@@ -58,6 +106,10 @@ testResult_t SendRecvRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
     NCCLCHECK(ncclSend(sptr, count, type, sendPeer, comm, stream));
     NCCLCHECK(ncclRecv(rptr, count, type, recvPeer, comm, stream));
     NCCLCHECK(ncclGroupEnd());
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+  } else if (deviceImpl == HOST_RMA_IMPL) {
+    TESTCHECK(SendRecvRmaPut(sendbuff, sendoffset, recvbuff, recvoffset, count, type, comm, stream));
+#endif
   } else {
     return testNotImplemented;
   }
@@ -123,12 +175,10 @@ testResult_t SendRecvRunTest(struct threadArgs* args, int root, ncclDataType_t t
   return testSuccess;
 }
 
-struct testEngine sendRecvEngine = {
-  .getBuffSize = SendRecvGetBuffSize,
-  .runTest = SendRecvRunTest,
+NCCL_WEAK struct testEngine ncclTestEngine = {
+  /* .getBuffSize = */ SendRecvGetBuffSize,
+  /* .runTest = */ SendRecvRunTest,
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,14,0)
-  .initCommConfig = SendRecvInitCommConfig,
+  /* .initCommConfig = */ SendRecvInitCommConfig,
 #endif
 };
-
-#pragma weak ncclTestEngine=sendRecvEngine

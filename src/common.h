@@ -6,7 +6,7 @@
 #ifndef __COMMON_H__
 #define __COMMON_H__
 
-#define NCCL_TESTS_VERSION "2.18.3"
+#define NCCL_TESTS_VERSION "2.20.0"
 
 #include "nccl.h"
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
@@ -15,15 +15,38 @@
 #include <stdio.h>
 #include <cstdint>
 #include <algorithm>
+#include <thread>
 #ifdef MPI_SUPPORT
 #include "mpi.h"
 #endif
-#include <pthread.h>
 #include "nccl1_compat.h"
 #include "timer.h"
+#include "os.h"
+
+#if defined(NCCL_OS_LINUX) && NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+// Allow binaries built with newer headers to load older NCCL libraries when optional APIs are unused.
+#pragma weak ncclCommQueryProperties
+#pragma weak ncclWinGetUserPtr
+#pragma weak ncclPutSignal
+#pragma weak ncclWaitSignal
+#endif
 
 // For nccl.h < 2.13 since we define a weak fallback
 extern "C" char const* ncclGetLastError(ncclComm_t comm);
+
+#define HOST_RMA_IMPL 10
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,4)
+#define NCCL_TESTS_HAS_HOST_RMA_SUPPORT_PROPERTY 1
+#else
+#define NCCL_TESTS_HAS_HOST_RMA_SUPPORT_PROPERTY 0
+#endif
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,31,0)
+#define NUM_RMA_SIG 4
+#else
+#define NUM_RMA_SIG 1
+#endif
 
 #define CUDACHECK(cmd) do {                         \
   cudaError_t err = cmd;                            \
@@ -83,7 +106,7 @@ typedef enum {
     char hostname[1024];                            \
     getHostName(hostname, 1024);                    \
     printf(" .. %s pid %d: Test failure %s:%d\n",   \
-         hostname, getpid(),                        \
+         hostname, ncclTestGetPid(),                \
         __FILE__,__LINE__);                         \
     return r;                                       \
   }                                                 \
@@ -97,7 +120,7 @@ struct testColl {
       size_t count, size_t eltSize, int nranks);
   testResult_t (*initData)(struct threadArgs* args, ncclDataType_t type,
       ncclRedOp_t op, int root, int rep, int in_place);
-  void (*getBw)(size_t count, int typesize, double sec, double* algBw, double* busBw, int nranks);
+  void (*getBw)(size_t count, size_t typesize, double sec, double* algBw, double* busBw, int nranks);
   testResult_t (*runColl)(void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset,
       size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, int implIndex);
 };
@@ -118,7 +141,7 @@ struct testEngine {
 #endif
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
-  testResult_t (*getDevCommRequirements)(int deviceImpl, ncclDevCommRequirements* reqs, ncclCommProperties_t* commProperties);
+  testResult_t (*getDevCommRequirements)(int deviceImpl, ncclDevCommRequirements* reqs, ncclComm_t comm);
 #elif NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
   bool (*getDevCommRequirements)(int deviceImpl, ncclDevCommRequirements* reqs);
 #endif
@@ -152,6 +175,8 @@ struct threadArgs {
   ncclDevComm* devComms;
 #endif
   cudaStream_t* streams;
+  cudaEvent_t* events;
+  float* ms;
 
   void** expected;
   size_t expectedBytes;
@@ -175,7 +200,7 @@ struct threadArgs {
 
 typedef testResult_t (*threadFunc_t)(struct threadArgs* args);
 struct testThread {
-  pthread_t thread;
+  std::thread thread;
   threadFunc_t func;
   struct threadArgs args;
   testResult_t ret;
@@ -186,12 +211,10 @@ extern void Barrier(struct threadArgs* args);
 extern testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* typeName, ncclRedOp_t op,  const char* opName, int root);
 extern testResult_t InitDataReduce(void* data, const size_t count, const size_t offset, ncclDataType_t type, ncclRedOp_t op, const uint64_t seed, const int nranks);
 extern testResult_t InitData(void* data, const size_t count, size_t offset, ncclDataType_t type, ncclRedOp_t op, const uint64_t seed, const int nranks, const int rank);
-extern testResult_t AllocateBuffs(void **sendbuff, size_t sendBytes, void **recvbuff, size_t recvBytes, void **expected, size_t nbytes);
-
-#include <unistd.h>
+extern testResult_t AllocateBuffs(void **sendbuff, size_t sendBytes, void **recvbuff, size_t recvBytes, void **expected, size_t nbytes, size_t *allocBytes);
 
 static void getHostName(char* hostname, int maxlen) {
-  gethostname(hostname, maxlen);
+  ncclTestGetHostname(hostname, maxlen);
   for (int i=0; i< maxlen; i++) {
     if (hostname[i] == '\0') {
       return;
@@ -203,46 +226,16 @@ static void getHostName(char* hostname, int maxlen) {
   }
 }
 
-#include <stdint.h>
-
-static uint64_t getHash(const char* string, size_t n) {
-  // Based on DJB2a, result = result * 33 ^ char
-  uint64_t result = 5381;
-  for (size_t c = 0; c < n; c++) {
-    result = ((result << 5) + result) ^ string[c];
-  }
-  return result;
-}
-
 /* Generate a hash of the unique identifying string for this host
  * that will be unique for both bare-metal and container instances
  * Equivalent of a hash of;
  *
- * $(hostname)$(cat /proc/sys/kernel/random/boot_id)
+ * $(hostname)$(cat /proc/sys/kernel/random/boot_id)       [Linux]
+ * $(hostname)$(MachineGuid from registry)                 [Windows]
  *
  */
-#define HOSTID_FILE "/proc/sys/kernel/random/boot_id"
 static uint64_t getHostHash(const char* hostname) {
-  char hostHash[1024];
-
-  // Fall back is the hostname if something fails
-  (void) strncpy(hostHash, hostname, sizeof(hostHash));
-  int offset = strlen(hostHash);
-
-  FILE *file = fopen(HOSTID_FILE, "r");
-  if (file != NULL) {
-    char *p;
-    if (fscanf(file, "%ms", &p) == 1) {
-        strncpy(hostHash+offset, p, sizeof(hostHash)-offset-1);
-        free(p);
-    }
-  }
-  fclose(file);
-
-  // Make sure the string is terminated
-  hostHash[sizeof(hostHash)-1]='\0';
-
-  return getHash(hostHash, strlen(hostHash));
+  return ncclTestGetHostHash(hostname);
 }
 
 #define HAVE_BF16 0
@@ -296,6 +289,7 @@ static size_t wordSize(ncclDataType_t type) {
 
 extern int test_ncclVersion; // init'd with ncclGetVersion()
 extern int deviceCtaCount; // number of CTAs for device implementation
+extern int rmaCtxCount; // number of RMA contexts to provision for host RMA (-H)
 constexpr int test_opNumMax = (int)ncclNumOps + (NCCL_VERSION_CODE >= NCCL_VERSION(2,11,0) ? 1 : 0);
 extern int test_opnum;
 extern int test_typenum;
